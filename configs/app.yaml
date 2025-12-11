@@ -1,0 +1,53 @@
+# Agent Orchestrator - Application Configuration
+# This file provides default settings. Environment variables override these values.
+
+# Application settings
+app:
+  name: "Agent Orchestrator"
+  version: "1.0.0"
+  env: development  # development, staging, production, testing
+  debug: true
+  host: "0.0.0.0"
+  port: 8000
+
+# Anthropic API settings (API key should be set via environment variable)
+anthropic:
+  api_key: ""  # Set ANTHROPIC_API_KEY environment variable
+
+# Logging configuration
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: json  # json, console
+
+# Redis configuration (optional - for production message bus)
+redis:
+  enabled: false
+  url: null  # Set REDIS_URL environment variable if needed
+
+# Security settings (set via environment variables in production)
+security:
+  api_key_secret: null  # Set API_KEY_SECRET environment variable
+  jwt_secret: null  # Set JWT_SECRET environment variable
+
+# Rate limiting
+rate_limit:
+  requests: 100  # Max requests per period
+  period: 60  # Period in seconds
+
+# Default agent settings
+agent_defaults:
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 4096
+  temperature: 0.7
+
+# Timeout settings (in seconds)
+timeout:
+  agent: 120  # Per-agent operation timeout
+  conversation: 300  # Total conversation timeout
+
+# Langfuse observability (LLM tracing)
+langfuse:
+  enabled: false
+  public_key: ""  # Set LANGFUSE_PUBLIC_KEY environment variable
+  secret_key: ""  # Set LANGFUSE_SECRET_KEY environment variable
+  host: "https://cloud.langfuse.com"

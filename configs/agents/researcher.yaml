@@ -1,0 +1,97 @@
+agent_id: "researcher_001"
+name: "Research Agent"
+description: "웹 검색 및 정보 수집 전문 Agent"
+
+agent_class: "src.agents.implementations.researcher.ResearchAgent"
+
+capabilities:
+  - name: "web_search"
+    description: "인터넷에서 정보 검색"
+    input_schema:
+      type: "object"
+      properties:
+        query:
+          type: "string"
+          description: "검색 쿼리"
+        max_results:
+          type: "integer"
+          default: 10
+      required:
+        - query
+    output_schema:
+      type: "object"
+      properties:
+        results:
+          type: "array"
+          items:
+            type: "object"
+            properties:
+              title:
+                type: "string"
+              url:
+                type: "string"
+              snippet:
+                type: "string"
+
+  - name: "summarization"
+    description: "텍스트 요약"
+    input_schema:
+      type: "object"
+      properties:
+        text:
+          type: "string"
+          description: "요약할 텍스트"
+        max_length:
+          type: "integer"
+          default: 500
+      required:
+        - text
+    output_schema:
+      type: "object"
+      properties:
+        summary:
+          type: "string"
+
+  - name: "data_extraction"
+    description: "텍스트에서 구조화된 데이터 추출"
+    input_schema:
+      type: "object"
+      properties:
+        text:
+          type: "string"
+          description: "데이터를 추출할 텍스트"
+        fields:
+          type: "array"
+          items:
+            type: "string"
+          description: "추출할 필드 목록"
+      required:
+        - text
+    output_schema:
+      type: "object"
+      properties:
+        extracted_data:
+          type: "object"
+
+model: "solar-pro2"
+max_tokens: 4096
+temperature: 0.3
+
+system_prompt: |
+  당신은 전문 리서치 Agent입니다.
+  주어진 주제에 대해 깊이 있는 조사를 수행하고,
+  정확하고 신뢰할 수 있는 정보를 제공합니다.
+
+  응답 시 항상:
+  - 출처를 명시하세요
+  - 핵심 정보를 구조화하여 제시하세요
+  - 불확실한 정보는 명확히 표시하세요
+  - 여러 관점을 고려하여 균형 잡힌 정보를 제공하세요
+
+metadata:
+  version: "1.0.0"
+  author: "Agent Orchestrator Team"
+  tags:
+    - research
+    - search
+    - information-gathering

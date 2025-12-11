@@ -1,0 +1,141 @@
+agent_id: "coder_001"
+name: "Coder Agent"
+description: "코드 생성 및 수정 전문 Agent"
+
+agent_class: "src.agents.implementations.coder.CoderAgent"
+
+capabilities:
+  - name: "code_generation"
+    description: "요구사항에 따른 새 코드 생성"
+    input_schema:
+      type: "object"
+      properties:
+        requirements:
+          type: "string"
+          description: "코드 생성 요구사항"
+        language:
+          type: "string"
+          description: "프로그래밍 언어"
+          default: "python"
+        style:
+          type: "string"
+          description: "코드 스타일"
+          default: "clean and readable"
+      required:
+        - requirements
+    output_schema:
+      type: "object"
+      properties:
+        code:
+          type: "string"
+        language:
+          type: "string"
+
+  - name: "code_modification"
+    description: "기존 코드 수정"
+    input_schema:
+      type: "object"
+      properties:
+        code:
+          type: "string"
+          description: "수정할 원본 코드"
+        modification:
+          type: "string"
+          description: "수정 지시사항"
+        language:
+          type: "string"
+          default: "python"
+      required:
+        - code
+        - modification
+    output_schema:
+      type: "object"
+      properties:
+        modified_code:
+          type: "string"
+        changes:
+          type: "array"
+          items:
+            type: "string"
+
+  - name: "code_explanation"
+    description: "코드 기능 설명"
+    input_schema:
+      type: "object"
+      properties:
+        code:
+          type: "string"
+          description: "설명할 코드"
+        language:
+          type: "string"
+          default: "python"
+        detail_level:
+          type: "string"
+          enum:
+            - brief
+            - comprehensive
+            - detailed
+          default: "comprehensive"
+      required:
+        - code
+    output_schema:
+      type: "object"
+      properties:
+        explanation:
+          type: "string"
+
+  - name: "debugging"
+    description: "코드 디버깅 및 오류 수정"
+    input_schema:
+      type: "object"
+      properties:
+        code:
+          type: "string"
+          description: "디버깅할 코드"
+        error:
+          type: "string"
+          description: "에러 메시지 또는 문제 설명"
+        language:
+          type: "string"
+          default: "python"
+      required:
+        - code
+        - error
+    output_schema:
+      type: "object"
+      properties:
+        fixed_code:
+          type: "string"
+        explanation:
+          type: "string"
+
+model: "solar-pro2"
+max_tokens: 8192
+temperature: 0.2
+
+system_prompt: |
+  당신은 전문 소프트웨어 엔지니어 Agent입니다.
+  깔끔하고, 효율적이며, 잘 문서화된 코드를 작성합니다.
+
+  코드 작성 시 항상:
+  - 최신 모범 사례와 디자인 패턴을 따르세요
+  - 명확한 변수명과 함수명을 사용하세요
+  - 적절한 주석과 문서화를 포함하세요
+  - 에러 처리와 엣지 케이스를 고려하세요
+  - 테스트 가능한 모듈화된 코드를 작성하세요
+  - 코드 블록은 항상 적절한 언어 지정과 함께 마크다운으로 감싸세요
+
+metadata:
+  version: "1.0.0"
+  author: "Agent Orchestrator Team"
+  tags:
+    - coding
+    - development
+    - programming
+  supported_languages:
+    - python
+    - javascript
+    - typescript
+    - java
+    - go
+    - rust

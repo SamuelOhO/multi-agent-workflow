@@ -1,0 +1,1049 @@
+"""API 라우트 정의.
+
+FastAPI 라우터와 엔드포인트를 정의합니다.
+"""
+
+from datetime import UTC, datetime
+from typing import Any
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+
+from src.agents.base import SimpleAgent
+from src.core.conversation import (
+    ConversationManager,
+    ConversationNotFoundError,
+    ConversationStateError,
+)
+from src.core.orchestrator import (
+    Orchestrator,
+)
+from src.core.registry import (
+    AgentAlreadyExistsError,
+    AgentNotFoundError,
+    AgentRegistry,
+)
+from src.models import (
+    AgentConfig,
+    AgentInfo,
+    Conversation,
+    ConversationPattern,
+    ConversationStage,
+    ConversationStatus,
+    Message,
+)
+
+from .schemas import (
+    AddMessageRequest,
+    AgentHealthResponse,
+    AgentResponse,
+    APIResponse,
+    ConversationResponse,
+    CreateConversationRequest,
+    CreateTaskRequest,
+    DebateTaskRequest,
+    HierarchicalTaskRequest,
+    MessageResponse,
+    ParallelTaskRequest,
+    RegisterAgentRequest,
+    RouterTaskRequest,
+    SequentialTaskRequest,
+    TaskResultResponse,
+    TaskStatusResponse,
+)
+
+# =============================================================================
+# Global Dependencies (will be injected at startup)
+# =============================================================================
+
+_registry: AgentRegistry | None = None
+_conversation_manager: ConversationManager | None = None
+_orchestrator: Orchestrator | None = None
+
+# Background tasks storage for async task execution
+_running_tasks: dict[str, Any] = {}
+
+
+def init_dependencies(
+    registry: AgentRegistry,
+    conversation_manager: ConversationManager,
+    orchestrator: Orchestrator,
+) -> None:
+    """Initialize API dependencies.
+
+    Args:
+        registry: Agent registry instance.
+        conversation_manager: Conversation manager instance.
+        orchestrator: Orchestrator instance.
+    """
+    global _registry, _conversation_manager, _orchestrator
+    _registry = registry
+    _conversation_manager = conversation_manager
+    _orchestrator = orchestrator
+
+
+def get_registry() -> AgentRegistry:
+    """Get the agent registry."""
+    if _registry is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service not initialized",
+        )
+    return _registry
+
+
+def get_conversation_manager() -> ConversationManager:
+    """Get the conversation manager."""
+    if _conversation_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service not initialized",
+        )
+    return _conversation_manager
+
+
+def get_orchestrator() -> Orchestrator:
+    """Get the orchestrator."""
+    if _orchestrator is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service not initialized",
+        )
+    return _orchestrator
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+def agent_info_to_response(info: AgentInfo) -> AgentResponse:
+    """Convert AgentInfo to AgentResponse."""
+    return AgentResponse(
+        agent_id=info.agent_id,
+        name=info.name,
+        description=info.description,
+        status=info.status,
+        capabilities=info.capabilities,
+        load=info.load,
+        metadata=info.metadata,
+    )
+
+
+def conversation_to_response(conv: Conversation) -> ConversationResponse:
+    """Convert Conversation to ConversationResponse."""
+    return ConversationResponse(
+        id=conv.id,
+        name=conv.name,
+        description=conv.description,
+        pattern=conv.pattern,
+        status=conv.status,
+        stages=[
+            {
+                "name": s.name,
+                "description": s.description,
+                "agent_capability": s.agent_capability,
+                "status": s.status.value,
+                "error": s.error,
+            }
+            for s in conv.stages
+        ],
+        current_stage_index=conv.current_stage_index,
+        messages_count=len(conv.messages),
+        created_at=conv.created_at,
+        started_at=conv.started_at,
+        completed_at=conv.completed_at,
+        timeout_seconds=conv.timeout_seconds,
+    )
+
+
+def message_to_response(msg: Message) -> MessageResponse:
+    """Convert Message to MessageResponse."""
+    return MessageResponse(
+        id=msg.id,
+        sender_id=msg.sender_id,
+        recipient_id=msg.recipient_id,
+        message_type=msg.message_type,
+        content=msg.content,
+        timestamp=msg.timestamp,
+        correlation_id=msg.correlation_id,
+    )
+
+
+# =============================================================================
+# Routers
+# =============================================================================
+
+agent_router = APIRouter(prefix="/agents", tags=["Agents"])
+task_router = APIRouter(prefix="/tasks", tags=["Tasks"])
+conversation_router = APIRouter(prefix="/conversations", tags=["Conversations"])
+
+
+# =============================================================================
+# Agent Endpoints
+# =============================================================================
+
+
+@agent_router.get(
+    "",
+    response_model=APIResponse,
+    summary="Agent 목록 조회",
+    description="등록된 모든 Agent의 목록을 조회합니다.",
+)
+async def list_agents() -> APIResponse:
+    """Get list of all registered agents."""
+    registry = get_registry()
+    agents = await registry.list_all()
+
+    return APIResponse(
+        success=True,
+        data=[agent_info_to_response(a).model_dump() for a in agents],
+        metadata={"count": len(agents), "timestamp": datetime.now(UTC).isoformat()},
+    )
+
+
+@agent_router.get(
+    "/{agent_id}",
+    response_model=APIResponse,
+    summary="Agent 상세 조회",
+    description="특정 Agent의 상세 정보를 조회합니다.",
+)
+async def get_agent(agent_id: str) -> APIResponse:
+    """Get agent details by ID."""
+    registry = get_registry()
+
+    try:
+        info = await registry.get_info(agent_id)
+        return APIResponse(
+            success=True,
+            data=agent_info_to_response(info).model_dump(),
+        )
+    except AgentNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@agent_router.post(
+    "",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Agent 등록",
+    description="새로운 Agent를 등록합니다.",
+)
+async def register_agent(request: RegisterAgentRequest) -> APIResponse:
+    """Register a new agent."""
+    registry = get_registry()
+
+    # Create agent config
+    config = AgentConfig(
+        agent_id=request.agent_id,
+        name=request.name,
+        description=request.description,
+        capabilities=request.to_capabilities(),
+        model=request.model,
+        max_tokens=request.max_tokens,
+        temperature=request.temperature,
+        system_prompt=request.system_prompt,
+        metadata=request.metadata,
+    )
+
+    # Create a simple agent instance
+    agent = SimpleAgent(config)
+
+    try:
+        info = await registry.register(agent)
+        return APIResponse(
+            success=True,
+            data=agent_info_to_response(info).model_dump(),
+            metadata={"message": f"Agent {request.agent_id} registered successfully"},
+        )
+    except AgentAlreadyExistsError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        ) from e
+
+
+@agent_router.delete(
+    "/{agent_id}",
+    response_model=APIResponse,
+    summary="Agent 제거",
+    description="등록된 Agent를 제거합니다.",
+)
+async def unregister_agent(agent_id: str) -> APIResponse:
+    """Unregister an agent."""
+    registry = get_registry()
+
+    if agent_id not in registry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Agent not found: {agent_id}",
+        )
+
+    await registry.unregister(agent_id)
+
+    return APIResponse(
+        success=True,
+        data={"agent_id": agent_id},
+        metadata={"message": f"Agent {agent_id} unregistered successfully"},
+    )
+
+
+@agent_router.post(
+    "/{agent_id}/activate",
+    response_model=APIResponse,
+    summary="Agent 활성화",
+    description="비활성화된 Agent를 활성화합니다.",
+)
+async def activate_agent(agent_id: str) -> APIResponse:
+    """Activate an agent."""
+    registry = get_registry()
+
+    try:
+        agent = await registry.get(agent_id)
+        agent.activate()
+        info = await registry.get_info(agent_id)
+        return APIResponse(
+            success=True,
+            data=agent_info_to_response(info).model_dump(),
+            metadata={"message": f"Agent {agent_id} activated successfully"},
+        )
+    except AgentNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@agent_router.post(
+    "/{agent_id}/deactivate",
+    response_model=APIResponse,
+    summary="Agent 비활성화",
+    description="활성화된 Agent를 비활성화합니다.",
+)
+async def deactivate_agent(agent_id: str) -> APIResponse:
+    """Deactivate an agent."""
+    registry = get_registry()
+
+    try:
+        agent = await registry.get(agent_id)
+        agent.deactivate()
+        info = await registry.get_info(agent_id)
+        return APIResponse(
+            success=True,
+            data=agent_info_to_response(info).model_dump(),
+            metadata={"message": f"Agent {agent_id} deactivated successfully"},
+        )
+    except AgentNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@agent_router.get(
+    "/{agent_id}/health",
+    response_model=APIResponse,
+    summary="Agent 상태 체크",
+    description="Agent의 상태를 체크합니다.",
+)
+async def check_agent_health(agent_id: str) -> APIResponse:
+    """Check agent health."""
+    registry = get_registry()
+
+    try:
+        health = await registry.health_check(agent_id)
+        response = AgentHealthResponse(
+            agent_id=health["agent_id"],
+            status=health.get("status", "unknown"),
+            capabilities=health.get("capabilities", []),
+            metadata={"model": health.get("model")},
+        )
+        return APIResponse(success=True, data=response.model_dump())
+    except AgentNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+# =============================================================================
+# Task Endpoints
+# =============================================================================
+
+
+@task_router.post(
+    "",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="작업 생성",
+    description="새로운 작업을 생성하고 실행합니다.",
+)
+async def create_task(
+    request: CreateTaskRequest,
+    background_tasks: BackgroundTasks,
+) -> APIResponse:
+    """Create and execute a new task."""
+    conv_manager = get_conversation_manager()
+    orchestrator = get_orchestrator()
+
+    # Build stages from request
+    stages = [
+        ConversationStage(
+            name=s.name,
+            description=s.description,
+            agent_capability=s.agent_capability,
+            agent_id=s.agent_id,
+            parallel_with=s.parallel_with,
+        )
+        for s in request.stages
+    ]
+
+    # Create the task input
+    task_input = {
+        "name": request.name,
+        "description": request.description,
+        **request.input,
+    }
+
+    # Create conversation
+    conversation = await conv_manager.create(
+        name=request.name,
+        description=request.description,
+        pattern=request.pattern,
+        stages=stages,
+        initial_input=task_input,
+        timeout_seconds=request.timeout_seconds,
+        max_iterations=request.max_iterations,
+        metadata=request.metadata,
+    )
+
+    # Execute task in background
+    async def execute_task() -> None:
+        try:
+            await orchestrator.execute_conversation(conversation.id)
+        except Exception:
+            # Errors are captured in the conversation status
+            pass
+
+    background_tasks.add_task(execute_task)
+
+    # Return immediately with task info
+    return APIResponse(
+        success=True,
+        data={
+            "task_id": conversation.id,
+            "status": conversation.status.value,
+            "pattern": conversation.pattern.value,
+        },
+        metadata={
+            "message": "Task created and execution started",
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+@task_router.get(
+    "/{task_id}",
+    response_model=APIResponse,
+    summary="작업 상태 조회",
+    description="작업의 현재 상태를 조회합니다.",
+)
+async def get_task_status(task_id: str) -> APIResponse:
+    """Get task status."""
+    orchestrator = get_orchestrator()
+
+    try:
+        status_info = await orchestrator.get_status(task_id)
+
+        conv_manager = get_conversation_manager()
+        conv = await conv_manager.get(task_id)
+
+        response = TaskStatusResponse(
+            task_id=task_id,
+            status=ConversationStatus(status_info["status"]),
+            pattern=ConversationPattern(status_info["pattern"]),
+            current_stage=status_info.get("current_stage"),
+            progress={
+                "completed_stages": status_info["completed_stages"],
+                "total_stages": status_info["total_stages"],
+                "messages_count": status_info["messages_count"],
+            },
+            created_at=conv.created_at,
+            started_at=conv.started_at,
+            agents_involved=[
+                m.sender_id for m in conv.messages if m.sender_id != "orchestrator"
+            ],
+        )
+
+        return APIResponse(success=True, data=response.model_dump())
+
+    except ConversationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@task_router.get(
+    "/{task_id}/result",
+    response_model=APIResponse,
+    summary="작업 결과 조회",
+    description="완료된 작업의 결과를 조회합니다.",
+)
+async def get_task_result(task_id: str) -> APIResponse:
+    """Get task result."""
+    conv_manager = get_conversation_manager()
+
+    try:
+        conv = await conv_manager.get(task_id)
+
+        if conv.status not in (
+            ConversationStatus.COMPLETED,
+            ConversationStatus.FAILED,
+            ConversationStatus.CANCELLED,
+        ):
+            return APIResponse(
+                success=True,
+                data={
+                    "task_id": task_id,
+                    "status": conv.status.value,
+                    "message": "Task is still in progress",
+                },
+            )
+
+        # Calculate duration
+        duration = 0.0
+        if conv.started_at and conv.completed_at:
+            duration = (conv.completed_at - conv.started_at).total_seconds()
+
+        # Collect agents involved
+        agents = set()
+        for msg in conv.messages:
+            agents.add(msg.sender_id)
+
+        # Collect intermediate results
+        intermediate = []
+        for stage in conv.stages:
+            if stage.output_data:
+                intermediate.append(
+                    {
+                        "stage": stage.name,
+                        "output": stage.output_data,
+                    }
+                )
+
+        response = TaskResultResponse(
+            task_id=task_id,
+            status=conv.status,
+            output=conv.final_output,
+            stages_completed=len(conv.get_completed_stages()),
+            stages_total=len(conv.stages),
+            agents_involved=list(agents),
+            messages_count=len(conv.messages),
+            duration_seconds=duration,
+            error=conv.metadata.get("error"),
+            intermediate_results=intermediate,
+        )
+
+        return APIResponse(success=True, data=response.model_dump())
+
+    except ConversationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@task_router.delete(
+    "/{task_id}",
+    response_model=APIResponse,
+    summary="작업 취소",
+    description="진행 중인 작업을 취소합니다.",
+)
+async def cancel_task(task_id: str) -> APIResponse:
+    """Cancel a running task."""
+    orchestrator = get_orchestrator()
+
+    try:
+        result = await orchestrator.cancel(task_id)
+
+        return APIResponse(
+            success=True,
+            data={
+                "task_id": task_id,
+                "status": result.status.value,
+            },
+            metadata={"message": "Task cancelled successfully"},
+        )
+
+    except ConversationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+    except ConversationStateError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        ) from e
+
+
+# =============================================================================
+# Pattern-specific Task Endpoints
+# =============================================================================
+
+
+@task_router.post(
+    "/sequential",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Sequential 패턴 작업",
+    description="Research → Code → Review 순차 실행. 웹 스크래퍼, 기능 개발 등에 적합.",
+)
+async def create_sequential_task(
+    request: SequentialTaskRequest,
+    background_tasks: BackgroundTasks,
+) -> APIResponse:
+    """순차 실행 작업 생성 (Research → Code → Review)."""
+    conv_manager = get_conversation_manager()
+    orchestrator = get_orchestrator()
+
+    stages = [
+        ConversationStage(name="research", agent_capability="web_search"),
+        ConversationStage(name="code", agent_capability="code_generation"),
+        ConversationStage(name="review", agent_capability="code_review"),
+    ]
+
+    conversation = await conv_manager.create(
+        name=f"Sequential: {request.topic[:50]}",
+        pattern=ConversationPattern.SEQUENTIAL,
+        stages=stages,
+        initial_input={"topic": request.topic},
+        timeout_seconds=request.timeout_seconds,
+    )
+
+    async def execute_task() -> None:
+        try:
+            await orchestrator.execute_conversation(conversation.id)
+        except Exception:
+            pass
+
+    background_tasks.add_task(execute_task)
+
+    return APIResponse(
+        success=True,
+        data={
+            "task_id": conversation.id,
+            "status": conversation.status.value,
+            "pattern": "sequential",
+            "stages": ["research", "code", "review"],
+        },
+        metadata={"message": "Sequential task started", "timestamp": datetime.now(UTC).isoformat()},
+    )
+
+
+@task_router.post(
+    "/parallel",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Parallel 패턴 작업",
+    description="Security, Performance, Style 리뷰 동시 실행. 코드 분석에 적합.",
+)
+async def create_parallel_task(
+    request: ParallelTaskRequest,
+    background_tasks: BackgroundTasks,
+) -> APIResponse:
+    """병렬 실행 작업 생성 (Security + Performance + Style 동시 분석)."""
+    conv_manager = get_conversation_manager()
+    orchestrator = get_orchestrator()
+
+    stages = [
+        ConversationStage(name="security", agent_capability="security_review"),
+        ConversationStage(name="performance", agent_capability="performance_review"),
+        ConversationStage(name="style", agent_capability="style_review"),
+    ]
+
+    conversation = await conv_manager.create(
+        name="Parallel: Code Analysis",
+        pattern=ConversationPattern.PARALLEL,
+        stages=stages,
+        initial_input={"code": request.code},
+        timeout_seconds=request.timeout_seconds,
+    )
+
+    async def execute_task() -> None:
+        try:
+            await orchestrator.execute_conversation(conversation.id)
+        except Exception:
+            pass
+
+    background_tasks.add_task(execute_task)
+
+    return APIResponse(
+        success=True,
+        data={
+            "task_id": conversation.id,
+            "status": conversation.status.value,
+            "pattern": "parallel",
+            "stages": ["security", "performance", "style"],
+        },
+        metadata={"message": "Parallel task started", "timestamp": datetime.now(UTC).isoformat()},
+    )
+
+
+@task_router.post(
+    "/debate",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Debate 패턴 작업",
+    description="낙관론자 vs 비관론자 토론. 의사결정, 분석에 적합.",
+)
+async def create_debate_task(
+    request: DebateTaskRequest,
+    background_tasks: BackgroundTasks,
+) -> APIResponse:
+    """토론 작업 생성 (낙관론자 vs 비관론자)."""
+    conv_manager = get_conversation_manager()
+    orchestrator = get_orchestrator()
+
+    stages = [
+        ConversationStage(name="optimist", agent_capability="debate", agent_id="optimist"),
+        ConversationStage(name="pessimist", agent_capability="debate", agent_id="pessimist"),
+    ]
+
+    conversation = await conv_manager.create(
+        name=f"Debate: {request.topic[:50]}",
+        pattern=ConversationPattern.DEBATE,
+        stages=stages,
+        initial_input={"topic": request.topic},
+        timeout_seconds=request.timeout_seconds,
+        max_iterations=request.max_iterations,
+    )
+
+    async def execute_task() -> None:
+        try:
+            await orchestrator.execute_conversation(conversation.id)
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] Debate task failed: {e}")
+            traceback.print_exc()
+
+    background_tasks.add_task(execute_task)
+
+    return APIResponse(
+        success=True,
+        data={
+            "task_id": conversation.id,
+            "status": conversation.status.value,
+            "pattern": "debate",
+            "stages": ["optimist", "pessimist"],
+            "max_iterations": request.max_iterations,
+        },
+        metadata={"message": "Debate task started", "timestamp": datetime.now(UTC).isoformat()},
+    )
+
+
+@task_router.post(
+    "/router",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Router 패턴 작업",
+    description="질문 유형에 따라 적절한 Agent로 라우팅. 버그/설명/생성 등.",
+)
+async def create_router_task(
+    request: RouterTaskRequest,
+    background_tasks: BackgroundTasks,
+) -> APIResponse:
+    """라우터 작업 생성 (질문 유형별 처리)."""
+    conv_manager = get_conversation_manager()
+    orchestrator = get_orchestrator()
+
+    stages = [
+        ConversationStage(name="debug", agent_capability="debugging"),
+        ConversationStage(name="explain", agent_capability="code_explanation"),
+        ConversationStage(name="generate", agent_capability="code_generation"),
+    ]
+
+    conversation = await conv_manager.create(
+        name=f"Router: {request.question[:50]}",
+        pattern=ConversationPattern.ROUTER,
+        stages=stages,
+        initial_input={"question": request.question},
+        timeout_seconds=request.timeout_seconds,
+    )
+
+    async def execute_task() -> None:
+        try:
+            await orchestrator.execute_conversation(conversation.id)
+        except Exception:
+            pass
+
+    background_tasks.add_task(execute_task)
+
+    return APIResponse(
+        success=True,
+        data={
+            "task_id": conversation.id,
+            "status": conversation.status.value,
+            "pattern": "router",
+            "stages": ["debug", "explain", "generate"],
+        },
+        metadata={"message": "Router task started", "timestamp": datetime.now(UTC).isoformat()},
+    )
+
+
+@task_router.post(
+    "/hierarchical",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Hierarchical 패턴 작업",
+    description="Supervisor가 Worker들에게 작업 분배. 프로젝트 관리에 적합.",
+)
+async def create_hierarchical_task(
+    request: HierarchicalTaskRequest,
+    background_tasks: BackgroundTasks,
+) -> APIResponse:
+    """계층 구조 작업 생성 (Supervisor → Workers)."""
+    conv_manager = get_conversation_manager()
+    orchestrator = get_orchestrator()
+
+    stages = [
+        ConversationStage(name="supervisor", agent_capability="web_search"),
+        ConversationStage(name="worker_code", agent_capability="code_generation"),
+        ConversationStage(name="worker_review", agent_capability="code_review"),
+    ]
+
+    conversation = await conv_manager.create(
+        name=f"Hierarchical: {request.project[:50]}",
+        pattern=ConversationPattern.HIERARCHICAL,
+        stages=stages,
+        initial_input={"project": request.project},
+        timeout_seconds=request.timeout_seconds,
+    )
+
+    async def execute_task() -> None:
+        try:
+            await orchestrator.execute_conversation(conversation.id)
+        except Exception:
+            pass
+
+    background_tasks.add_task(execute_task)
+
+    return APIResponse(
+        success=True,
+        data={
+            "task_id": conversation.id,
+            "status": conversation.status.value,
+            "pattern": "hierarchical",
+            "stages": ["supervisor", "worker_code", "worker_review"],
+        },
+        metadata={"message": "Hierarchical task started", "timestamp": datetime.now(UTC).isoformat()},
+    )
+
+
+# =============================================================================
+# Conversation Endpoints
+# =============================================================================
+
+
+@conversation_router.get(
+    "",
+    response_model=APIResponse,
+    summary="대화 목록 조회",
+    description="모든 대화 목록을 조회합니다. status 파라미터로 필터링 가능합니다.",
+)
+async def list_conversations(
+    status_filter: ConversationStatus | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> APIResponse:
+    """Get list of all conversations."""
+    conv_manager = get_conversation_manager()
+
+    if status_filter:
+        conversations = await conv_manager.list_by_status(status_filter)
+    else:
+        conversations = await conv_manager.list_all()
+
+    # Sort by created_at descending (most recent first)
+    conversations = sorted(conversations, key=lambda c: c.created_at, reverse=True)
+
+    # Apply pagination
+    total = len(conversations)
+    conversations = conversations[offset : offset + limit]
+
+    return APIResponse(
+        success=True,
+        data=[conversation_to_response(c).model_dump() for c in conversations],
+        metadata={
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "count": len(conversations),
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+@conversation_router.post(
+    "",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="대화 생성",
+    description="새로운 대화를 생성합니다.",
+)
+async def create_conversation(request: CreateConversationRequest) -> APIResponse:
+    """Create a new conversation."""
+    conv_manager = get_conversation_manager()
+
+    stages = [
+        ConversationStage(
+            name=s.name,
+            description=s.description,
+            agent_capability=s.agent_capability,
+            agent_id=s.agent_id,
+            parallel_with=s.parallel_with,
+        )
+        for s in request.stages
+    ]
+
+    conversation = await conv_manager.create(
+        name=request.name,
+        description=request.description,
+        pattern=request.pattern,
+        stages=stages,
+        initial_input=request.initial_input,
+        timeout_seconds=request.timeout_seconds,
+        max_iterations=request.max_iterations,
+        metadata=request.metadata,
+    )
+
+    return APIResponse(
+        success=True,
+        data=conversation_to_response(conversation).model_dump(),
+        metadata={"message": "Conversation created successfully"},
+    )
+
+
+@conversation_router.get(
+    "/{conversation_id}",
+    response_model=APIResponse,
+    summary="대화 상태 조회",
+    description="대화의 현재 상태를 조회합니다.",
+)
+async def get_conversation(conversation_id: str) -> APIResponse:
+    """Get conversation status."""
+    conv_manager = get_conversation_manager()
+
+    try:
+        conversation = await conv_manager.get(conversation_id)
+        return APIResponse(
+            success=True,
+            data=conversation_to_response(conversation).model_dump(),
+        )
+    except ConversationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@conversation_router.get(
+    "/{conversation_id}/messages",
+    response_model=APIResponse,
+    summary="대화 메시지 조회",
+    description="대화의 모든 메시지를 조회합니다.",
+)
+async def get_conversation_messages(conversation_id: str) -> APIResponse:
+    """Get all messages in a conversation."""
+    conv_manager = get_conversation_manager()
+
+    try:
+        messages = await conv_manager.get_messages(conversation_id)
+        return APIResponse(
+            success=True,
+            data=[message_to_response(m).model_dump() for m in messages],
+            metadata={"count": len(messages)},
+        )
+    except ConversationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@conversation_router.post(
+    "/{conversation_id}/messages",
+    response_model=APIResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="메시지 추가",
+    description="대화에 메시지를 추가합니다.",
+)
+async def add_message(
+    conversation_id: str,
+    request: AddMessageRequest,
+) -> APIResponse:
+    """Add a message to a conversation."""
+    conv_manager = get_conversation_manager()
+
+    try:
+        # Create message
+        message = Message(
+            sender_id=request.sender_id,
+            recipient_id=request.recipient_id,
+            message_type=request.message_type,
+            content=request.content,
+        )
+
+        await conv_manager.add_message(conversation_id, message)
+
+        return APIResponse(
+            success=True,
+            data=message_to_response(message).model_dump(),
+            metadata={"message": "Message added successfully"},
+        )
+
+    except ConversationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+# =============================================================================
+# Main API Router
+# =============================================================================
+
+api_router = APIRouter(prefix="/api/v1")
+api_router.include_router(agent_router)
+api_router.include_router(task_router)
+api_router.include_router(conversation_router)
+
+
+# Health check endpoint
+@api_router.get(
+    "/health",
+    response_model=APIResponse,
+    summary="시스템 상태 체크",
+    description="시스템 전체 상태를 체크합니다.",
+)
+async def health_check() -> APIResponse:
+    """System health check."""
+    registry = get_registry()
+    conv_manager = get_conversation_manager()
+
+    agent_count = len(registry)
+    conv_count = len(conv_manager)
+
+    return APIResponse(
+        success=True,
+        data={
+            "status": "healthy",
+            "agents_registered": agent_count,
+            "active_conversations": conv_count,
+        },
+        metadata={"timestamp": datetime.now(UTC).isoformat()},
+    )

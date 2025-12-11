@@ -315,7 +315,9 @@ class Orchestrator:
         Returns:
             Stage output.
         """
+        print(f"[DEBUG] Executing stage: {stage.name}")
         agent = await self._select_agent(stage)
+        print(f"[DEBUG] Selected agent: {agent.config.agent_id}")
 
         message = Message.create_task(
             sender_id=self.ORCHESTRATOR_ID,
@@ -329,7 +331,9 @@ class Orchestrator:
         )
 
         await self.conversation_manager.add_message(conversation.id, message)
+        print(f"[DEBUG] Calling agent.process()...")
         response = await agent.process(message)
+        print(f"[DEBUG] Got response: {response.content}")
         await self.conversation_manager.add_message(conversation.id, response)
 
         result = response.content.get("result", response.content)
@@ -407,6 +411,7 @@ class Orchestrator:
         """Execute debate pattern.
 
         Agents discuss and iterate until consensus or max iterations.
+        Then a judge provides the final conclusion.
         """
         if len(conversation.stages) < 2:
             return await self.conversation_manager.fail(
@@ -415,6 +420,7 @@ class Orchestrator:
 
         current_proposal = conversation.initial_input
         iteration = 0
+        all_debate_history: list[dict[str, Any]] = []
 
         while iteration < conversation.max_iterations:
             iteration += 1
@@ -431,8 +437,8 @@ class Orchestrator:
                     output = await self._execute_single_stage(conversation, stage)
                     debate_round["responses"].append(
                         {
-                            "agent": stage.agent_capability,
-                            "response": output,
+                            "agent": stage.name,
+                            "response": output.get("result", output),
                         }
                     )
 
@@ -460,14 +466,108 @@ class Orchestrator:
                         error=str(e),
                     )
 
-        # Max iterations reached without consensus
+            all_debate_history.append(debate_round)
+
+        # Get final conclusion from judge
+        conclusion = await self._get_judge_conclusion(
+            conversation, current_proposal, all_debate_history
+        )
+
         final_output = {
             "consensus": False,
-            "final_proposal": current_proposal,
+            "topic": current_proposal.get("topic", str(current_proposal)),
             "iterations": conversation.max_iterations,
-            "message": "Max iterations reached without consensus",
+            "debate_history": all_debate_history,
+            "conclusion": conclusion,
         }
         return await self.conversation_manager.complete(conversation.id, final_output)
+
+    async def _get_judge_conclusion(
+        self,
+        conversation: Conversation,
+        topic: dict[str, Any],
+        debate_history: list[dict[str, Any]],
+    ) -> str:
+        """Get final conclusion from judge agent.
+
+        Args:
+            conversation: The conversation.
+            topic: The debate topic.
+            debate_history: All debate rounds.
+
+        Returns:
+            Judge's conclusion.
+        """
+        # Try to find judge agent
+        judge_agent = None
+        try:
+            judge_agent = await self.registry.get("judge")
+        except AgentNotFoundError:
+            # Try to find by capability
+            judge_agent = await self.registry.find_one_by_capability("judge")
+
+        if judge_agent is None:
+            # No judge available, generate summary from debate
+            return self._generate_debate_summary(debate_history)
+
+        # Prepare debate summary for judge
+        debate_summary = self._format_debate_for_judge(topic, debate_history)
+
+        # Create judge stage
+        judge_stage = ConversationStage(
+            name="judge",
+            agent_capability="judge",
+            agent_id="judge",
+        )
+        judge_stage.input_data = {
+            "task": f"다음 토론을 분석하고 최종 결론을 도출해주세요:\n\n{debate_summary}",
+        }
+
+        print("[DEBUG] Executing judge stage...")
+        try:
+            output = await self._execute_single_stage(conversation, judge_stage)
+            return output.get("result", str(output))
+        except Exception as e:
+            print(f"[DEBUG] Judge failed: {e}")
+            return self._generate_debate_summary(debate_history)
+
+    def _format_debate_for_judge(
+        self, topic: dict[str, Any], debate_history: list[dict[str, Any]]
+    ) -> str:
+        """Format debate history for judge analysis."""
+        topic_str = topic.get("topic", str(topic)) if isinstance(topic, dict) else str(topic)
+        lines = [f"## 토론 주제\n{topic_str}\n"]
+
+        for round_data in debate_history:
+            lines.append(f"\n### 라운드 {round_data['iteration']}")
+            for resp in round_data["responses"]:
+                agent_name = resp["agent"]
+                response = resp["response"]
+                if isinstance(response, dict):
+                    response = response.get("result", str(response))
+                lines.append(f"\n**{agent_name}**:\n{response}")
+
+        return "\n".join(lines)
+
+    def _generate_debate_summary(self, debate_history: list[dict[str, Any]]) -> str:
+        """Generate a simple summary when no judge is available."""
+        if not debate_history:
+            return "토론 내용이 없습니다."
+
+        last_round = debate_history[-1]
+        summary_parts = ["## 최종 라운드 요약\n"]
+
+        for resp in last_round.get("responses", []):
+            agent_name = resp.get("agent", "Unknown")
+            response = resp.get("response", "")
+            if isinstance(response, dict):
+                response = response.get("result", str(response))
+            # Truncate if too long
+            if len(str(response)) > 500:
+                response = str(response)[:500] + "..."
+            summary_parts.append(f"**{agent_name}**: {response}")
+
+        return "\n\n".join(summary_parts)
 
     async def _select_agent(self, stage: ConversationStage) -> BaseAgent:
         """Select an agent for a stage.
